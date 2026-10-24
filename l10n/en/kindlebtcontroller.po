@@ -431,5 +431,119 @@ msgstr "axis_code,value"
 msgid "摇杆 轴%d值%d 未配置映射"
 msgstr "Joystick axis %d value %d has no mapping"
 
-msgid "⚠️ 蓝牙控制器配置错误！\n\n设备路径 %s 是 KOReader 已打开的系统设备「%s」（如触摸屏或电源键），而非蓝牙控制器。\n\n请修改 config.lua 中的 device_path。\n\n提示：使用 ls /dev/input 查看设备列表，蓝牙控制器通常是编号最大的 eventX。"
-msgstr "⚠️ Bluetooth Controller config error!\n\nDevice path %s is a system device \"%s\" already opened by KOReader (e.g., touchscreen or power button), not a Bluetooth controller.\n\nPlease update device_path in config.lua.\n\nTip: Run ls /dev/input to list devices. The Bluetooth controller is usually the eventX with the highest number."
+msgid "⚠️ 蓝牙控制器配置错误！\n\n设备路径 %s 是 KOReader 已打开的系统设备「%s」（如触摸屏或电源键），而非蓝牙控制器。\n\n请先连接手柄，然后在菜单「蓝牙控制器 → 已配对蓝牙设备」中选择它。"
+msgstr "⚠️ Bluetooth Controller config error!\n\nDevice path %s is a system device \"%s\" already opened by KOReader (e.g., touchscreen or power button), not a Bluetooth controller.\n\nConnect your controller first, then pick it under \"Bluetooth Controller → Paired Bluetooth Devices\"."
+
+msgid "已自动选择控制设备：%s"
+msgstr "Control device selected automatically: %s"
+
+msgid "未知设备"
+msgstr "Unknown device"
+
+msgid "蓝牙设备已连接：%s"
+msgstr "Bluetooth device connected: %s"
+
+msgid "此设备型号（%s）不受支持。旧款 Kindle（如 KO、KPW3）使用此方法可能导致白屏，已取消。"
+msgstr "This device model (%s) is not supported. On older Kindles (e.g. KO, KPW3) this method may cause a white screen, so it was cancelled."
+
+msgid "将修改 Kindle 系统文件以支持蓝牙手柄/键盘：\n\n• 安装输入设备识别脚本和 udev 规则\n• 关闭蓝牙断开时产生的核心转储日志\n\n设备型号：%s\n仅在 Kindle 2024、KPW5、KPW6 及更新机型上验证过。\n\n是否继续？"
+msgstr "This will modify Kindle system files to support Bluetooth controllers/keyboards:\n\n• Install the input device detection script and udev rule\n• Disable core dump logs created when Bluetooth disconnects\n\nDevice model: %s\nOnly verified on Kindle 2024, KPW5, KPW6 and newer.\n\nContinue?"
+
+msgid "准备"
+msgstr "Prepare"
+
+msgid "正在准备系统，请稍候..."
+msgstr "Preparing system, please wait..."
+
+msgid "系统准备完成，现在可以配对手柄。"
+msgstr "System is ready. You can now pair your controller."
+
+msgid "系统准备失败："
+msgstr "System preparation failed:"
+
+msgid "尚未为蓝牙手柄准备好 Kindle 系统。现在自动完成吗？\n\n设备型号：%s\n\n也可以稍后在菜单「蓝牙控制器」中操作。"
+msgstr "The Kindle is not yet prepared for Bluetooth controllers. Do it automatically now?\n\nDevice model: %s\n\nYou can also do this later from the \"Bluetooth Controller\" menu."
+
+msgid "现在准备"
+msgstr "Prepare now"
+
+msgid "以后再说"
+msgstr "Later"
+
+msgid "请先开启蓝牙"
+msgstr "Please turn Bluetooth on first"
+
+msgid "未找到 ace_bt_cli，无法配对"
+msgstr "ace_bt_cli not found, cannot pair"
+
+msgid "配对新蓝牙设备"
+msgstr "Pair New Bluetooth Device"
+
+msgid "请先让手柄进入配对模式，然后输入其蓝牙地址（例如 AA:BB:CC:DD:EE:FF）："
+msgstr "Put the controller in pairing mode, then enter its Bluetooth address (e.g. AA:BB:CC:DD:EE:FF):"
+
+msgid "配对"
+msgstr "Pair"
+
+msgid "蓝牙地址格式错误"
+msgstr "Invalid Bluetooth address format"
+
+msgid "正在配对，请稍候（约 20 秒）..."
+msgstr "Pairing, please wait (about 20 seconds)..."
+
+msgid "已配对并选择设备：%s"
+msgstr "Paired and selected device: %s"
+
+msgid "已配对：%s\n但尚未发现输入设备，请确认手柄已连接，然后点击「重载设备」。"
+msgstr "Paired: %s\nbut no input device was found yet. Make sure the controller is connected, then tap \"Reload Device\"."
+
+msgid "未能确认配对成功。\n请确认手柄处于配对模式后重试。\n\nace_bt_cli 输出：\n%s"
+msgstr "Could not confirm that pairing succeeded.\nMake sure the controller is in pairing mode and try again.\n\nace_bt_cli output:\n%s"
+
+msgid "✓ 系统已准备"
+msgstr "✓ System Ready"
+
+msgid "准备系统（首次使用）"
+msgstr "Prepare System (first-time setup)"
+
+msgid "配对新设备"
+msgstr "Pair New Device"
+
+msgid "设备型号 %s 不受支持"
+msgstr "Device model %s is not supported"
+
+msgid "需要 root 权限才能修改系统文件"
+msgstr "Root permission is required to modify system files"
+
+msgid "无法将系统分区切换为可写"
+msgstr "Could not remount the system partition as writable"
+
+msgid "已安装输入设备识别脚本"
+msgstr "Input device detection script installed"
+
+msgid "写入 %s 失败：%s"
+msgstr "Failed to write %s: %s"
+
+msgid "已安装 udev 规则"
+msgstr "udev rule installed"
+
+msgid "已重载 udev 规则"
+msgstr "udev rules reloaded"
+
+msgid "udev 规则重载失败，重启 Kindle 后生效"
+msgstr "Could not reload udev rules; they will apply after restarting the Kindle"
+
+msgid "已关闭断开连接时的核心转储日志"
+msgstr "Core dump logs on disconnect disabled"
+
+msgid "无法创建核心转储标记文件"
+msgstr "Could not create the core dump marker files"
+
+msgid "已调整 dmcc.sh（原文件已备份）"
+msgstr "dmcc.sh adjusted (original backed up)"
+
+msgid "修改 dmcc.sh 失败，已跳过"
+msgstr "Could not modify dmcc.sh, skipped"
+
+msgid "dmcc.sh 与预期不符，已跳过（可选步骤，详见 README）"
+msgstr "dmcc.sh does not look as expected, skipped (optional step, see README)"
