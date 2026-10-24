@@ -12,6 +12,17 @@ local ffi = require("ffi")
 local C = ffi.C
 
 local BluetoothStateManager = require("bluetooth_state_manager")
+local SystemSetup = require("system_setup")
+
+-- 已知的 Kindle 系统输入设备名称（触摸屏、电源键等），绝不能当作蓝牙控制器使用
+local KNOWN_SYSTEM_INPUT_NAMES = {
+    ["pt_mt"] = true,             -- Kindle 触摸屏 (multi-touch)
+    ["bd71828-pwrkey"] = true,    -- Kindle 电源键
+    ["goodix-ts"] = true,         -- Kindle 触摸屏 (multi-touch)
+}
+
+-- 最多主动询问几次是否准备系统（避免每次启动都打扰用户）
+local MAX_SETUP_PROMPTS = 2
 
 -- =======================================================
 --  统一动作注册表（表驱动，单一数据源）
@@ -66,6 +77,12 @@ for _, entry in ipairs(ACTION_REGISTRY) do
     ACTION_NAME_MAP[entry.id] = entry.name
     table.insert(ACTION_ID_LIST, entry.id)
 end
+
+-- 兼容别名：旧版默认配置里把 prev_page 误写成了 pre_page，
+-- 而且这些值已经被写进了用户的 settings/kindlebtcontroller.lua。
+-- 不加入 ACTION_ID_LIST，因此不会出现在动作选择列表里。
+ACTION_EXEC_MAP["pre_page"] = ACTION_EXEC_MAP["prev_page"]
+ACTION_NAME_MAP["pre_page"] = ACTION_NAME_MAP["prev_page"]
 
 -- 按键名称表
 local KEY_NAMES = {
@@ -132,10 +149,12 @@ function BluetoothController:init()
     -- 第二次初始化（打开书籍时）跳过，避免与 KOReader 内部的设备管理冲突
     if not _G._bt_device_initialized then
         _G._bt_device_initialized = true
+        self:autoSelectDevice()
         if self:validateDevicePath() then
             self:ensureConnected()
         end
         self:startReconnectWatcher()
+        self:maybePromptSystemSetup()
     end
 
     logger.info("BT Plugin: Initialization complete")
@@ -264,6 +283,9 @@ function BluetoothController:validateDevicePath()
     local path = self.config.device_path
     if not path then return true end
 
+    -- 已按名称选择设备时，路径由名称解析得出，不会指向系统设备
+    if self.config.device_name then return true end
+
     -- 读取设备名称，用于日志和提示
     local device_name = self:getInputDeviceName(path)
     logger.info(string.format("BT Plugin: Configured device_path = %s, device_name = %s",
@@ -281,18 +303,9 @@ function BluetoothController:validateDevicePath()
 
     -- 检测 2：设备名称是否匹配已知的 Kindle 系统设备
     if not is_system_device and device_name then
-        local known_system_devices = {
-            "pt_mt",            -- Kindle 触摸屏 (multi-touch)
-            "bd71828-pwrkey",   -- Kindle 电源键
-            "goodix-ts",   -- Kindle 触摸屏 (multi-touch)
-        }
-        local lower_name = device_name:lower()
-        for _i, known_name in ipairs(known_system_devices) do
-            if lower_name == known_name then
-                is_system_device = true
-                reason = "matches known system device name"
-                break
-            end
+        if KNOWN_SYSTEM_INPUT_NAMES[device_name:lower()] then
+            is_system_device = true
+            reason = "matches known system device name"
         end
     end
 
@@ -303,7 +316,7 @@ function BluetoothController:validateDevicePath()
         UIManager:scheduleIn(2, function()
             UIManager:show(InfoMessage:new{
                 text = string.format(
-                        _("⚠️ 蓝牙控制器配置错误！\n\n设备路径 %s 是 KOReader 已打开的系统设备「%s」（如触摸屏或电源键），而非蓝牙控制器。\n\n请修改 config.lua 中的 device_path。\n\n提示：使用 ls /dev/input 查看设备列表，蓝牙控制器通常是编号最大的 eventX。"),
+                        _("⚠️ 蓝牙控制器配置错误！\n\n设备路径 %s 是 KOReader 已打开的系统设备「%s」（如触摸屏或电源键），而非蓝牙控制器。\n\n请先连接手柄，然后在菜单「蓝牙控制器 → 已配对蓝牙设备」中选择它。"),
                         path, display_name
                 ),
             })
@@ -316,6 +329,7 @@ end
 
 --- 读取输入设备的名称（通过 /sys/class/input/eventX/device/name）
 function BluetoothController:getInputDeviceName(path)
+    if not path then return nil end
     local event_name = path:match("(event%d+)$")
     if not event_name then return nil end
 
@@ -328,9 +342,71 @@ function BluetoothController:getInputDeviceName(path)
     return device_name
 end
 
+--- 获取当前应使用的输入设备路径。
+--- 已按名称选择设备（config.device_name）时，每次都按名称重新解析：
+--- 蓝牙手柄每次重连后 eventX 的编号可能变化，旧路径可能已属于别的设备。
+--- 此时设备不在线则返回 nil，绝不回退到旧路径。
+--- 未设置名称时沿用 config.device_path（旧版行为）。
+function BluetoothController:getActivePath()
+    local name = self.config.device_name
+    if not name or name == "" then
+        return self.config.device_path
+    end
+
+    local path = self:getInputDevicePathByName(name, self.config.device_path)
+    if path and path ~= self.config.device_path then
+        logger.info(string.format("BT Plugin: Device '%s' moved %s -> %s",
+                name, tostring(self.config.device_path), path))
+        self.config.device_path = path
+        self:saveSettings()
+    end
+    return path
+end
+
+--- 在已配对设备中自动选择当前在线的输入设备（无需手动查找 eventX）。
+--- 仅当「恰好一个」已配对设备当前有输入节点时才自动选择，避免选错。
+function BluetoothController:autoSelectDevice()
+    -- 之前选择的设备仍然在线：保持不变
+    if self.config.device_name and self:getInputDevicePathByName(self.config.device_name) then
+        return true
+    end
+
+    local devices = self:getPairedBluetoothDevices()
+    if not devices or #devices == 0 then return false end
+
+    local candidates = {}
+    for _i, device in ipairs(devices) do
+        if device.name and not KNOWN_SYSTEM_INPUT_NAMES[device.name:lower()] then
+            local path = self:getInputDevicePathByName(device.name)
+            if path then
+                table.insert(candidates, { name = device.name, path = path })
+            end
+        end
+    end
+
+    if #candidates ~= 1 then
+        if #candidates > 1 then
+            logger.info("BT Plugin: Multiple paired input devices online, not auto-selecting")
+        end
+        return false
+    end
+
+    self.config.device_name = candidates[1].name
+    self.config.device_path = candidates[1].path
+    self:saveSettings()
+    logger.info(string.format("BT Plugin: Auto-selected %s (%s)", candidates[1].name, candidates[1].path))
+    UIManager:scheduleIn(3, function()
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("已自动选择控制设备：%s"), candidates[1].name),
+            timeout = 3,
+        })
+    end)
+    return true
+end
+
 function BluetoothController:ensureConnected()
     local input = Device.input
-    local path = self.config.device_path
+    local path = self:getActivePath()
     if not input or not path then return false end
 
     if input.opened_devices and input.opened_devices[path] then
@@ -351,6 +427,7 @@ function BluetoothController:ensureConnected()
     end
     if ok then
         _G._bt_was_connected = true
+        _G._bt_opened_path = path
         _G._bt_last_device_name = self:getInputDeviceName(path)
     end
     return ok
@@ -358,12 +435,16 @@ end
 
 function BluetoothController:reloadDevice()
     local input = Device.input
-    local path = self.config.device_path
+    local path = self:getActivePath()
     if not input or not path then return false end
 
-    if input.opened_devices and input.opened_devices[path] then
-        logger.warn("BT Plugin: Closing old connection " .. path)
-        pcall(function() input:close(path) end)
+    -- 只关闭本插件自己打开过的设备（路径可能已随重连改变），
+    -- 避免误关触摸屏等系统设备
+    local old_path = _G._bt_opened_path
+    if old_path and input.opened_devices and input.opened_devices[old_path] then
+        logger.warn("BT Plugin: Closing old connection " .. old_path)
+        pcall(function() input:close(old_path) end)
+        _G._bt_opened_path = nil
     end
 
     logger.warn("BT Plugin: Re-opening " .. path)
@@ -372,6 +453,7 @@ function BluetoothController:reloadDevice()
     -- 重新注册输入钩子，确保 close/open 后钩子仍然有效
     if ok then
         _G._bt_was_connected = true
+        _G._bt_opened_path = path
         _G._bt_last_device_name = self:getInputDeviceName(path)
         self:registerInputHook()
     end
@@ -384,7 +466,7 @@ function BluetoothController:isDeviceAvailable()
     if not _G.KOBluetoothStateManager or not _G.KOBluetoothStateManager:isOn() then
         return false
     end
-    local path = self.config.device_path
+    local path = self:getActivePath()
     if not path then return false end
     local file = io.open(path, "r")
     if file then
@@ -518,8 +600,13 @@ function BluetoothController:getPairedBluetoothDevices()
     return devices, nil
 end
 
-function BluetoothController:getInputDevicePathByName(target_name)
+function BluetoothController:getInputDevicePathByName(target_name, preferred_path)
     if not target_name or target_name == "" then return nil end
+
+    -- 先检查上次使用的路径，命中则无需扫描全部 eventX（重连检测每 2 秒调用一次）
+    if preferred_path and self:getInputDeviceName(preferred_path) == target_name then
+        return preferred_path
+    end
 
     for event_id = 0, 63 do
         local name_path = string.format("/sys/class/input/event%d/device/name", event_id)
@@ -603,6 +690,7 @@ function BluetoothController:usePairedBluetoothDevice(device)
                     callback = function()
                         UIManager:close(confirm_dialog)
                         self.config.device_path = input_path
+                        self.config.device_name = device.name
                         self:saveSettings()
                         self:onBluetoothReloadDevice()
                         UIManager:show(InfoMessage:new{
@@ -801,6 +889,8 @@ end
 
 function BluetoothController:onBluetoothReloadDevice()
     self:loadSettings()
+    -- 手柄刚配对/连接后，自动识别它对应的输入设备
+    self:autoSelectDevice()
     if self:reloadDevice() then
         local device_name = self:getConnectedDeviceName() or _("未知")
         UIManager:show(InfoMessage:new{
@@ -1712,6 +1802,182 @@ function BluetoothController:deleteSingleMapping(mapping_type, code, value, on_d
 end
 
 -- =======================================================
+--  系统准备与配对（取代原来的 SSH 手动步骤）
+-- =======================================================
+
+function BluetoothController:showUnsupportedModel()
+    UIManager:show(InfoMessage:new{
+        text = string.format(
+                _("此设备型号（%s）不受支持。旧款 Kindle（如 KO、KPW3）使用此方法可能导致白屏，已取消。"),
+                SystemSetup.getModel()
+        ),
+    })
+end
+
+--- 询问用户后执行系统准备
+function BluetoothController:promptSystemSetup()
+    if SystemSetup.isUnsupportedModel() then
+        self:showUnsupportedModel()
+        return
+    end
+
+    UIManager:show(ConfirmBox:new{
+        text = string.format(
+                _("将修改 Kindle 系统文件以支持蓝牙手柄/键盘：\n\n• 安装输入设备识别脚本和 udev 规则\n• 关闭蓝牙断开时产生的核心转储日志\n\n设备型号：%s\n仅在 Kindle 2024、KPW5、KPW6 及更新机型上验证过。\n\n是否继续？"),
+                SystemSetup.getModel()
+        ),
+        ok_text = _("准备"),
+        ok_callback = function()
+            self:runSystemSetup()
+        end,
+    })
+end
+
+function BluetoothController:runSystemSetup()
+    local progress = InfoMessage:new{ text = _("正在准备系统，请稍候...") }
+    UIManager:show(progress)
+    UIManager:forceRePaint()
+
+    UIManager:scheduleIn(0.3, function()
+        local ok, steps = SystemSetup.apply()
+        UIManager:close(progress)
+
+        local lines = {}
+        for _i, step in ipairs(steps) do
+            local mark = step.level == "ok" and "✓ " or (step.level == "warn" and "! " or "✗ ")
+            table.insert(lines, mark .. step.msg)
+        end
+        local head = ok and _("系统准备完成，现在可以配对手柄。") or _("系统准备失败：")
+        UIManager:show(InfoMessage:new{ text = head .. "\n\n" .. table.concat(lines, "\n") })
+    end)
+end
+
+--- 启动时若系统尚未准备好，主动询问（最多 MAX_SETUP_PROMPTS 次）
+function BluetoothController:maybePromptSystemSetup()
+    if SystemSetup.isUnsupportedModel() then return end
+    if (self.config.setup_prompt_count or 0) >= MAX_SETUP_PROMPTS then return end
+    if not SystemSetup.hasTools() then return end
+    if SystemSetup.getState().ok then return end
+
+    self.config.setup_prompt_count = (self.config.setup_prompt_count or 0) + 1
+    self:saveSettings()
+
+    UIManager:scheduleIn(4, function()
+        UIManager:show(ConfirmBox:new{
+            text = string.format(
+                    _("尚未为蓝牙手柄准备好 Kindle 系统。现在自动完成吗？\n\n设备型号：%s\n\n也可以稍后在菜单「蓝牙控制器」中操作。"),
+                    SystemSetup.getModel()
+            ),
+            ok_text = _("现在准备"),
+            cancel_text = _("以后再说"),
+            ok_callback = function()
+                self:runSystemSetup()
+            end,
+        })
+    end)
+end
+
+--- 输入蓝牙地址并配对新设备（实验性）
+function BluetoothController:pairNewDevice()
+    if SystemSetup.isUnsupportedModel() then
+        self:showUnsupportedModel()
+        return
+    end
+    if not _G.KOBluetoothStateManager or not _G.KOBluetoothStateManager:isOn() then
+        UIManager:show(InfoMessage:new{ text = _("请先开启蓝牙"), timeout = 3 })
+        return
+    end
+    if not SystemSetup.hasPairTool() then
+        UIManager:show(InfoMessage:new{ text = _("未找到 ace_bt_cli，无法配对"), timeout = 3 })
+        return
+    end
+
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("配对新蓝牙设备"),
+        description = _("请先让手柄进入配对模式，然后输入其蓝牙地址（例如 AA:BB:CC:DD:EE:FF）："),
+        input_hint = "AA:BB:CC:DD:EE:FF",
+        buttons = {
+            {
+                {
+                    text = _("取消"),
+                    callback = function() UIManager:close(dialog) end,
+                },
+                {
+                    text = _("配对"),
+                    is_enter_default = true,
+                    callback = function()
+                        local mac = dialog:getInputText() or ""
+                        mac = mac:gsub("%s", "")
+                        mac = mac:gsub("%-", ":")
+                        if SystemSetup.isValidMac(mac) then
+                            UIManager:close(dialog)
+                            self:runPairing(mac)
+                        else
+                            UIManager:show(InfoMessage:new{ text = _("蓝牙地址格式错误"), timeout = 2 })
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function BluetoothController:runPairing(mac)
+    local progress = InfoMessage:new{ text = _("正在配对，请稍候（约 20 秒）...") }
+    UIManager:show(progress)
+    UIManager:forceRePaint()
+
+    UIManager:scheduleIn(0.3, function()
+        local ok, log = SystemSetup.pair(mac)
+        UIManager:close(progress)
+
+        if not ok then
+            UIManager:show(InfoMessage:new{
+                text = log == "missing_tool" and _("未找到 ace_bt_cli，无法配对") or _("蓝牙地址格式错误"),
+                timeout = 3,
+            })
+            return
+        end
+
+        -- ace_bt_cli 的输出格式未经验证，因此以系统状态为准判断是否成功
+        local paired_device
+        for _i, device in ipairs(self:getPairedBluetoothDevices() or {}) do
+            if device.mac and device.mac:lower() == mac:lower() then
+                paired_device = device
+                break
+            end
+        end
+        local input_path = paired_device and paired_device.name
+                and self:getInputDevicePathByName(paired_device.name)
+
+        if input_path then
+            self.config.device_name = paired_device.name
+            self.config.device_path = input_path
+            self:saveSettings()
+            self:reloadDevice()
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("已配对并选择设备：%s"), paired_device.name),
+                timeout = 3,
+            })
+        elseif paired_device then
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("已配对：%s\n但尚未发现输入设备，请确认手柄已连接，然后点击「重载设备」。"),
+                        paired_device.name or mac),
+            })
+        else
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("未能确认配对成功。\n请确认手柄处于配对模式后重试。\n\nace_bt_cli 输出：\n%s"),
+                        (log or ""):sub(-300)),
+            })
+        end
+    end)
+end
+
+-- =======================================================
 --  菜单界面
 -- =======================================================
 
@@ -1740,7 +2006,7 @@ function BluetoothController:addToMainMenu(menu_items)
                     if not _G.KOBluetoothStateManager or not _G.KOBluetoothStateManager:isOn() then
                         return _("当前设备：蓝牙已关闭")
                     end
-                    local device_name = self:getInputDeviceName(self.config.device_path)
+                    local device_name = self:getInputDeviceName(self:getActivePath())
                     if not device_name then
                         return _("当前设备：无")
                     end
@@ -1749,6 +2015,23 @@ function BluetoothController:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 enabled_func = function() return false end,
                 callback = function() end,
+            },
+            {
+                text_func = function()
+                    if SystemSetup.getState().ok then
+                        return _("✓ 系统已准备")
+                    end
+                    return _("准备系统（首次使用）")
+                end,
+                callback = function()
+                    self:promptSystemSetup()
+                end,
+            },
+            {
+                text = _("配对新设备"),
+                callback = function()
+                    self:pairNewDevice()
+                end,
             },
             self:getPairedBluetoothDevicesMenu(),
             {

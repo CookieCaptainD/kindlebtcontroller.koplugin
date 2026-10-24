@@ -1,12 +1,14 @@
-
 return {
-    -- 默认设备路径
-    device_path = "/dev/input/event2",
+    -- 控制设备由插件自动识别：连接并配对手柄后，会按已配对设备的名称
+    -- 解析出对应的 /dev/input/eventX（device_name 由插件自动写入 settings）。
+    -- 仅在自动识别失败时才需要手动指定，例如：
+    -- device_path = "/dev/input/event2",
+    device_path = nil,
 
     -- 默认按键映射
     key_map = {
-        [103] = "pre_page",
-        [105] = "pre_page",
+        [103] = "prev_page",
+        [105] = "prev_page",
         [108] = "next_page",
         [106] = "next_page",
         [28] = "next_page",
@@ -23,7 +25,7 @@ return {
         [314] = "full_refresh",
         [316] = "go_home",
     },
-    
+
     -- 摇杆映射
     joy_map = {
         [16] = {

@@ -12,7 +12,10 @@ local DataStorage = require("datastorage")
 
 local GetText = {
     translation = {},
-    loaded_lang = nil,  -- tracks which language we loaded
+    -- tracks which language we loaded. `false` (not nil) = "nothing loaded yet":
+    -- English users have no `language` setting (nil), which would otherwise look
+    -- identical to "already loaded" and the .po file would never be read.
+    loaded_lang = false,
 }
 
 local GetText_mt = {}

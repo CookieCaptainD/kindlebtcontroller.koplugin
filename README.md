@@ -6,6 +6,8 @@ A KOReader plugin that enables Bluetooth game controllers / remote controllers t
 
 ### Features
 
+- **One-Tap System Setup** — The plugin prepares the Kindle for Bluetooth controllers itself, no SSH needed (new, see Quick Start)
+- **Automatic Device Detection** — The controller is found by name, so `eventX` numbers never need to be looked up or edited
 - **Bluetooth Control** — Toggle Bluetooth on/off directly from KOReader menu
 - **Fully Customizable Key Mapping** — Map any controller button or joystick axis to 20+ actions
 - **Multi-Action Support** — Bind multiple actions to a single button press
@@ -60,13 +62,27 @@ This plugin has been tested and verified on the following Kindle models:
 - **Software**: [KOReader](https://github.com/koreader/koreader) installed on your Kindle
 - **Controller**: Any Bluetooth HID gamepad or remote (Classic BR/EDR Bluetooth only, **BLE is NOT supported**)
 
-#### Before You Install: Prepare Bluetooth Pairing
+#### Quick Start
+
+> 🆕 Since v0.2.0 the plugin does the system preparation itself. These features have not been verified on every firmware, so if a step fails, use the [manual setup](#manual-setup-fallback) below.
+
+1. Download the latest release from [Releases](https://github.com/qiuyukang/kindlebtcontroller.koplugin/releases), extract it, and copy the `kindlebtcontroller.koplugin` folder into `koreader/plugins/` on the Kindle (plain USB copy, no SSH needed).
+2. Restart KOReader.
+3. Open **Tools → Bluetooth Controller → Prepare System (first-time setup)** and confirm. The plugin installs the detection script and udev rule, disables the core-dump logs, and puts the system partition back to read-only. It refuses to run on unsupported models. (On the first launches, the plugin also offers this automatically.)
+4. Put the controller in pairing mode, open **Pair New Device** and enter its Bluetooth address (printed on the device or shown by your phone). *Pairing from the menu is experimental.*
+5. Done. The controller is selected automatically and shows up under "Current Device". Use "Key Tester" to remap buttons.
+
+Nothing in this flow requires `ls /dev/input`, `evtest`, or editing `config.lua`.
+
+#### Manual Setup (fallback)
+
+The steps below are what **Prepare System** and **Pair New Device** automate. Use them only if the menu entries fail on your device.
 
 > ⚠️ **Important**: Kindle's native system does not support connecting non-audio Bluetooth devices. Special configuration is required to connect Bluetooth keyboards or game controllers.
 >
 > ⚠️ **Device safety warning**: Do not use the following pairing steps on unsupported older Kindle models, including KO and KPW3. These steps are only intended for the tested models above and newer compatible models. Using them on unsupported devices may cause a white screen and require manual recovery.
 
-Before installing this plugin, you must first pair your Kindle with a Bluetooth controller. By default, the Kindle system does not allow pairing with non-audio Bluetooth devices, so the setup must be completed from the command line.
+By default, the Kindle system does not allow pairing with non-audio Bluetooth devices, so these steps have to be done from the command line.
 
 Reference: [Kindle Bluetooth Pairing Guide (MobileRead)](https://www.mobileread.com/forums/showthread.php?t=369712)
 
@@ -163,16 +179,15 @@ vi /usr/bin/dmcc.sh
 
 <img src="screenshots/dmcc.png">
 
-### Install the Plugin
+### Install the Plugin (manual alternative)
 
-1. Download the latest release from [Releases](https://github.com/qiuyukang/kindlebtcontroller.koplugin/releases)
-2. Extract and copy the `kindlebtcontroller.koplugin` directory to KOReader's plugin directory:
+If you already have an SSH session, you can copy the plugin from there instead of using USB:
 
 ```bash
 cp -r kindlebtcontroller.koplugin /mnt/us/koreader/plugins/
 ```
 
-3. Restart KOReader
+Then restart KOReader.
 
 ### Configuration
 
@@ -182,7 +197,8 @@ The default configuration ships with mappings for a typical Bluetooth gamepad:
 
 ```lua
 return {
-    device_path = "/dev/input/event2",
+    -- device_path is detected automatically (by device name); set it only if
+    -- automatic detection fails, e.g. device_path = "/dev/input/event2",
 
     key_map = {
         [304] = "next_page",    -- BTN_A
@@ -205,11 +221,16 @@ return {
 }
 ```
 
+#### Device Selection
+
+The plugin identifies your controller by its **name** (taken from the paired-device list) and looks up the matching `/dev/input/eventX` every time it connects. That number can change between reconnections; following the name means it does not matter.
+
+- On start-up, or when you tap "Reload Device", the plugin selects the controller automatically **if exactly one paired device is currently online**. With several candidates it does not guess: pick the right one under "Paired Bluetooth Devices".
+- A selected device that is offline is never replaced by a stale path, so the touchscreen or power button can not be hijacked after a renumbering.
+
 #### Finding Your Device Path (Advanced / Troubleshooting)
 
-The sample default path is `/dev/input/event2`. In most cases, you no longer need to change this path manually; it is only useful when troubleshooting.
-
-After your Bluetooth controller is connected, run:
+You normally do not need this. If automatic detection fails and you want to set `device_path` by hand, connect your controller and run:
 
 ```bash
 ls /dev/input
@@ -235,6 +256,8 @@ After installation, find "Bluetooth Controller" in the KOReader menu under Tools
 
 - **Bluetooth Toggle** — Toggle Bluetooth on/off
 - **Current Device** — Shows the device currently used to control Kindle
+- **Prepare System** — One-time setup of the Kindle for Bluetooth controllers (shows ✓ once done; safe to run again)
+- **Pair New Device** — Pair a controller by Bluetooth address (experimental)
 - **Paired Bluetooth Devices** — Shows paired devices and device details
 - **Reload Device** — Manually reload the Bluetooth input device
 - **Key Tester** — Enter key detection mode to identify button codes
@@ -264,6 +287,7 @@ kindlebtcontroller.koplugin/
 ├── main.lua                     # Core plugin logic
 ├── config.lua                   # Default key mappings
 ├── bluetooth_state_manager.lua  # Bluetooth state singleton
+├── system_setup.lua             # One-tap system preparation and pairing helper
 ├── gettext_btcontroller.lua     # i18n loader
 ├── l10n/                        # Translation files
 │   └── en/
@@ -280,7 +304,10 @@ A background watcher polls for device reconnection every 2 seconds. When a previ
 
 ### Troubleshooting
 
-- **Controller not detected**: Make sure the Bluetooth device is connected. For troubleshooting, use `ls /dev/input` to check whether a new `eventX` device appears.
+- **Controller not detected**: Make sure the Bluetooth device is connected, then tap "Reload Device". If several paired devices are online, choose yours under "Paired Bluetooth Devices". As a last resort, use `ls /dev/input` to check whether a new `eventX` device appears.
+- **"Prepare System" reports warnings**: A `!` line is an optional step that was skipped (for example when `dmcc.sh` differs from the expected layout); the original is backed up as `/usr/bin/dmcc.sh.kindlebtcontroller.bak` when it is modified. Errors (✗) mean the plugin could not change the system; use the manual setup.
+- **"Pair New Device" can not confirm pairing**: It drives the interactive `ace_bt_cli` tool and then checks the system state. If it fails, pair manually as described in the manual setup.
+- **Up/Left buttons did nothing in older versions**: the old default config contained a typo (`pre_page`). It is now treated as `prev_page`, including in already-saved settings.
 - **Buttons not working**: Use "Key Tester" to verify button codes, then check mappings in "Key Config".
 - **Bluetooth won't turn on**: Ensure your Kindle model supports Bluetooth. Try toggling from Kindle's native settings first.
 - **Debug logs**: Search for `BT Plugin` in KOReader's `crash.log` for detailed event logs.

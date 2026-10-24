@@ -60,13 +60,28 @@
 - **软件**：Kindle 上已安装 [KOReader](https://github.com/koreader/koreader)
 - **控制器**：任意蓝牙 HID 手柄或遥控器（仅支持经典 BR/EDR 蓝牙，**不支持低功耗 BLE 蓝牙**）
 
-#### 安装前准备：完成蓝牙配对
+#### 快速开始
+
+> 🆕 从 v0.2.0 起，系统准备由插件自动完成。该流程未在所有固件上验证；如果某一步失败，请使用下面的[手动配置](#手动配置备用方案)。
+
+1. 从 [Releases](https://github.com/qiuyukang/kindlebtcontroller.koplugin/releases) 下载最新版本，解压后将 `kindlebtcontroller.koplugin` 文件夹通过 USB 复制到 Kindle 的 `koreader/plugins/` 目录（无需 SSH）。
+2. 重启 KOReader。
+3. 打开 **工具 → 蓝牙控制器 → 准备系统（首次使用）** 并确认。插件会安装识别脚本和 udev 规则、关闭核心转储日志，并把系统分区恢复为只读。不受支持的机型会被拒绝。（前几次启动时，插件也会主动询问。）
+4. 让手柄进入配对模式，打开 **配对新设备**，输入手柄的蓝牙地址。*菜单内配对为实验性功能。*
+5. 完成。手柄会被自动选中，并显示在「当前设备」中。可用「按键检测」重新映射按键。
+
+整个流程不再需要 `ls /dev/input`、`evtest`，也不需要修改 `config.lua`。
+
+#### 手动配置（备用方案）
+
+以下步骤就是「准备系统」和「配对新设备」自动完成的内容，仅在菜单项在你的设备上失败时使用。
+
 
 > ⚠️ **重要提示**：Kindle 原生系统不支持连接非音频蓝牙设备，需要进行特殊配置后才可以连接蓝牙键盘或手柄。
 >
 > ⚠️ **设备安全警告**：以下配对步骤仅适用于上面列出的已验证机型，以及更新且兼容的 Kindle 设备。请勿在 KO、KPW3 等不受支持的老型号上尝试这些步骤，否则可能造成白屏并需要手动恢复。
 
-在安装本插件之前，需要先让 Kindle 与蓝牙控制器完成配对。Kindle 原生系统默认不支持配对非音频设备，需要通过命令行操作。
+Kindle 原生系统默认不支持配对非音频设备，因此这些步骤需要通过命令行完成。
 
 参考：[Kindle Bluetooth Pairing Guide (MobileRead)](https://www.mobileread.com/forums/showthread.php?t=369712)
 
@@ -157,16 +172,15 @@ vi /usr/bin/dmcc.sh
 ```
 <img src="screenshots/dmcc.png">
 
-### 安装步骤
+### 安装步骤（手动备选）
 
-1. 从 [Releases](https://github.com/qiuyukang/kindlebtcontroller.koplugin/releases) 下载最新版本的压缩包
-2. 解压后将 `kindlebtcontroller.koplugin` 目录复制到 KOReader 插件目录：
+如果已有 SSH 连接，也可以直接在设备上复制插件：
 
 ```bash
 cp -r kindlebtcontroller.koplugin /mnt/us/koreader/plugins/
 ```
 
-3. 重启 KOReader
+然后重启 KOReader。
 
 ### 配置
 
@@ -176,7 +190,8 @@ cp -r kindlebtcontroller.koplugin /mnt/us/koreader/plugins/
 
 ```lua
 return {
-    device_path = "/dev/input/event2",
+    -- device_path 会按设备名称自动识别；仅在自动识别失败时才需要手动设置，
+    -- 例如：device_path = "/dev/input/event2",
 
     key_map = {
         [304] = "next_page",    -- BTN_A
@@ -199,11 +214,16 @@ return {
 }
 ```
 
+#### 设备选择
+
+插件按**设备名称**（来自已配对设备列表）识别手柄，并在每次连接时重新查找对应的 `/dev/input/eventX`。eventX 的编号在重连后可能变化，按名称跟随即可避免问题。
+
+- 启动时或点击「重载设备」时，如果**恰好有一个**已配对设备在线，插件会自动选中它；有多个候选时不会猜测，请在「已配对蓝牙设备」中自行选择。
+- 已选设备离线时不会回退到旧路径，因此编号变化后不会误占触摸屏或电源键。
+
 #### 查找设备路径（高级/排错）
 
-默认配置中示例路径为 `/dev/input/event2`。大多数情况下，你不再需要手动修改这个路径；只有在排错时，才需要手动查看。
-
-蓝牙控制器连接成功后，运行：
+通常不需要这一步。如果自动识别失败，需要手动指定 `device_path`，请在手柄连接后运行：
 
 ```bash
 ls /dev/input
@@ -229,6 +249,8 @@ ls /dev/input
 
 - **蓝牙开关** — 开启/关闭蓝牙
 - **当前设备** — 显示当前用于控制 Kindle 的设备名称
+- **准备系统** — 一次性准备 Kindle 以支持蓝牙手柄（完成后显示 ✓，可重复运行）
+- **配对新设备** — 通过蓝牙地址配对手柄（实验性）
 - **已配对蓝牙设备** — 查看已配对设备列表和设备详情
 - **重载设备** — 手动重新加载蓝牙输入设备
 - **按键检测** — 进入按键检测模式，识别手柄按键码
@@ -258,6 +280,7 @@ kindlebtcontroller.koplugin/
 ├── main.lua                     # 核心插件逻辑
 ├── config.lua                   # 默认按键映射
 ├── bluetooth_state_manager.lua  # 蓝牙状态管理单例
+├── system_setup.lua             # 一键系统准备与配对辅助
 ├── gettext_btcontroller.lua     # 多语言加载器
 ├── l10n/                        # 翻译文件目录
 │   └── en/
