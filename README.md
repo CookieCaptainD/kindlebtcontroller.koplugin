@@ -8,7 +8,8 @@ A KOReader plugin that enables Bluetooth game controllers / remote controllers t
 
 - **One-Tap System Setup** — The plugin prepares the Kindle for Bluetooth controllers itself, no SSH needed (new, see Quick Start)
 - **Automatic Device Detection** — The controller is found by name, so `eventX` numbers never need to be looked up or edited
-- **Bluetooth Control** — Toggle Bluetooth on/off directly from KOReader menu
+- **Bluetooth Control** — Toggle Bluetooth on/off directly from KOReader menu; if the usual method does not start the radio (for example after a reboot with Bluetooth off), other methods are tried automatically and the result tells you what was attempted
+- **Search & Pair** — Scans for nearby devices and lets you pick one from a list, no Bluetooth address and no computer needed
 - **Fully Customizable Key Mapping** — Map any controller button or joystick axis to 20+ actions
 - **Multi-Action Support** — Bind multiple actions to a single button press
 - **Key Tester** — Real-time detection of controller button codes with instant mapping
@@ -64,19 +65,19 @@ This plugin has been tested and verified on the following Kindle models:
 
 #### Quick Start
 
-> 🆕 Since v0.2.0 the plugin does the system preparation itself. These features have not been verified on every firmware, so if a step fails, use the [manual setup](#manual-setup-fallback) below.
+> 🆕 Since v0.2 the plugin does the system preparation itself. These features have not been verified on every firmware, so if a step fails, use the [manual setup](#manual-setup-fallback) below.
 
 1. Download the latest release from [Releases](https://github.com/qiuyukang/kindlebtcontroller.koplugin/releases), extract it, and copy the `kindlebtcontroller.koplugin` folder into `koreader/plugins/` on the Kindle (plain USB copy, no SSH needed).
 2. Restart KOReader.
 3. Open **Tools → Bluetooth Controller → Prepare System (first-time setup)** and confirm. The plugin installs the detection script and udev rule, disables the core-dump logs, and puts the system partition back to read-only. It refuses to run on unsupported models. (On the first launches, the plugin also offers this automatically.)
-4. Put the controller in pairing mode, open **Pair New Device** and enter its Bluetooth address (printed on the device or shown by your phone). *Pairing from the menu is experimental.*
+4. Put the controller in pairing mode and open **Search & Pair New Device**. The plugin turns Bluetooth on if needed, searches for about 12 seconds and lists what it found. Tap your controller. If nothing shows up, use "Search Again", or "Enter Address Manually" as a last resort. *Searching and pairing from the menu is experimental.*
 5. Done. The controller is selected automatically and shows up under "Current Device". Use "Key Tester" to remap buttons.
 
 Nothing in this flow requires `ls /dev/input`, `evtest`, or editing `config.lua`.
 
 #### Manual Setup (fallback)
 
-The steps below are what **Prepare System** and **Pair New Device** automate. Use them only if the menu entries fail on your device.
+The steps below are what **Prepare System** and **Search & Pair New Device** automate. Use them only if the menu entries fail on your device.
 
 > ⚠️ **Important**: Kindle's native system does not support connecting non-audio Bluetooth devices. Special configuration is required to connect Bluetooth keyboards or game controllers.
 >
@@ -257,7 +258,7 @@ After installation, find "Bluetooth Controller" in the KOReader menu under Tools
 - **Bluetooth Toggle** — Toggle Bluetooth on/off
 - **Current Device** — Shows the device currently used to control Kindle
 - **Prepare System** — One-time setup of the Kindle for Bluetooth controllers (shows ✓ once done; safe to run again)
-- **Pair New Device** — Pair a controller by Bluetooth address (experimental)
+- **Search & Pair New Device** — Scan for nearby devices, pick one and pair it (experimental)
 - **Paired Bluetooth Devices** — Shows paired devices and device details
 - **Reload Device** — Manually reload the Bluetooth input device
 - **Key Tester** — Enter key detection mode to identify button codes
@@ -287,7 +288,8 @@ kindlebtcontroller.koplugin/
 ├── main.lua                     # Core plugin logic
 ├── config.lua                   # Default key mappings
 ├── bluetooth_state_manager.lua  # Bluetooth state singleton
-├── system_setup.lua             # One-tap system preparation and pairing helper
+├── system_setup.lua             # One-tap system preparation (udev, dmcc.sh, markers)
+├── bt_control.lua               # Bluetooth power, scan and pairing via the Kindle's btfd service
 ├── gettext_btcontroller.lua     # i18n loader
 ├── l10n/                        # Translation files
 │   └── en/
@@ -305,8 +307,9 @@ A background watcher polls for device reconnection every 2 seconds. When a previ
 ### Troubleshooting
 
 - **Controller not detected**: Make sure the Bluetooth device is connected, then tap "Reload Device". If several paired devices are online, choose yours under "Paired Bluetooth Devices". As a last resort, use `ls /dev/input` to check whether a new `eventX` device appears.
-- **"Prepare System" reports warnings**: A `!` line is an optional step that was skipped (for example when `dmcc.sh` differs from the expected layout); the original is backed up as `/usr/bin/dmcc.sh.kindlebtcontroller.bak` when it is modified. Errors (✗) mean the plugin could not change the system; use the manual setup.
-- **"Pair New Device" can not confirm pairing**: It drives the interactive `ace_bt_cli` tool and then checks the system state. If it fails, pair manually as described in the manual setup.
+- **"Prepare System" reports an error about `dmcc.sh`**: The plugin only edits the line `if [ ! -e "/PRE_GM_DEBUGGING_FEATURES_ENABLED__REMOVE_AT_GMC" ]; then` (removing the `!`, as the guide describes). If your firmware has a different first `if`, nothing is changed and that line is shown so it can be supported; please report it. When the file is edited, the original is backed up as `/usr/bin/dmcc.sh.kindlebtcontroller.bak`.
+- **"Search & Pair" finds nothing**: The controller must be in pairing mode and use Classic Bluetooth (BLE is not supported). Try "Search Again". Pairing first uses the Kindle's own Bluetooth service and falls back to `ace_bt_cli`; success is always checked against the system's paired-device list, never assumed.
+- **Bluetooth will not switch on/off**: The message lists every method that was tried and the final `BTstate`. If it keeps failing, switch Bluetooth on once in the Kindle's own settings and please report that message in an issue.
 - **Up/Left buttons did nothing in older versions**: the old default config contained a typo (`pre_page`). It is now treated as `prev_page`, including in already-saved settings.
 - **Buttons not working**: Use "Key Tester" to verify button codes, then check mappings in "Key Config".
 - **Bluetooth won't turn on**: Ensure your Kindle model supports Bluetooth. Try toggling from Kindle's native settings first.
@@ -325,6 +328,10 @@ Contributions for other languages are welcome! Simply create a language folder u
 ### License
 
 MIT
+
+### Credits
+
+The `com.lab126.btfd` properties used for scanning and bonding (`triggerBTscan`, `ListDiscovered`, `Bond`, `Connect`, and the `BTenable` value formats) were documented and verified on a Paperwhite 5 by [audiobook.koplugin](https://github.com/stradichenko/audiobook.koplugin). `bt_control.lua` is an independent implementation.
 
 ### Author
 

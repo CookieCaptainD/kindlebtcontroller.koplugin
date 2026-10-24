@@ -13,6 +13,7 @@ local C = ffi.C
 
 local BluetoothStateManager = require("bluetooth_state_manager")
 local SystemSetup = require("system_setup")
+local BtControl = require("bt_control")
 
 -- 已知的 Kindle 系统输入设备名称（触摸屏、电源键等），绝不能当作蓝牙控制器使用
 local KNOWN_SYSTEM_INPUT_NAMES = {
@@ -809,34 +810,48 @@ end
 --  蓝牙硬件状态控制
 -- =======================================================
 
-function BluetoothController:setBluetoothState(enable)
-    local flight_mode_value = enable and 0 or 1
-    local expected_state = enable and 1 or 0
+--- 开/关蓝牙（异步：等待期间不会卡住界面）。
+--- 冷启动后蓝牙从未开启过时，仅靠 BTflightMode 可能无效，
+--- 因此依次尝试多种方式，并给每种方式足够的生效时间（见 bt_control.lua）。
+function BluetoothController:setBluetoothState(enable, on_done)
+    if self.bt_busy then return end
+    self.bt_busy = true
+    self.target_state = enable
 
-    os.execute(string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", flight_mode_value))
+    local progress = InfoMessage:new{
+        text = enable and _("正在开启蓝牙...") or _("正在关闭蓝牙..."),
+    }
+    UIManager:show(progress)
+    UIManager:forceRePaint()
 
-    local actual_state = _G.KOBluetoothStateManager:getStateValue()
-    for _ = 1, 3 do
-        if actual_state == expected_state then
-            break
-        end
-        os.execute("usleep 200000")
-        actual_state = _G.KOBluetoothStateManager:getStateValue()
-    end
+    BtControl.setPower(enable, {
+        schedule = function(delay, fn) UIManager:scheduleIn(delay, fn) end,
+        on_done = function(success, info)
+            self.bt_busy = false
+            UIManager:close(progress)
+            if _G.KOBluetoothStateManager then
+                _G.KOBluetoothStateManager:_updateState()
+            end
+            self.target_state = info.state > 0
 
-    _G.KOBluetoothStateManager:_updateState()
-
-    local success = actual_state == expected_state
-    local msg
-    if success then
-        msg = enable and _("蓝牙已开启") or _("蓝牙已禁用")
-    else
-        msg = enable and _("蓝牙开启失败，请前往 Kindle 系统设置中操作") or _("蓝牙关闭失败，请前往 Kindle 系统设置中操作")
-    end
-
-    self.target_state = actual_state > 0
-    UIManager:show(InfoMessage:new{ text = msg, timeout = 2 })
-    return success
+            if success then
+                UIManager:show(InfoMessage:new{
+                    text = enable and _("蓝牙已开启") or _("蓝牙已禁用"),
+                    timeout = 2,
+                })
+            else
+                local tried = table.concat(info.tried, ", ")
+                logger.warn(string.format("BT Plugin: power %s failed, tried: %s, BTstate=%d",
+                        enable and "on" or "off", tried, info.state))
+                UIManager:show(InfoMessage:new{
+                    text = string.format(
+                            _("蓝牙开关切换失败。\n\n已尝试：%s\n当前状态：BTstate=%d\n\n如果问题持续，请先在 Kindle 系统设置中开启一次蓝牙。"),
+                            tried, info.state),
+                })
+            end
+            if on_done then on_done(success) end
+        end,
+    })
 end
 
 function BluetoothController:onDispatcherRegisterActions()
@@ -875,16 +890,8 @@ function BluetoothController:onBluetoothKeyConfig()
 end
 
 function BluetoothController:onToggleBluetooth()
-    local now = os.time()
-    local next_state
-    if (now - self.last_action_time) < 2 then
-        next_state = not self.target_state
-    else
-        next_state = not _G.KOBluetoothStateManager:isOn()
-    end
-    self.target_state = next_state
-    self.last_action_time = now
-    self:setBluetoothState(next_state)
+    if self.bt_busy then return end
+    self:setBluetoothState(not BtControl.isOn())
 end
 
 function BluetoothController:onBluetoothReloadDevice()
@@ -1847,7 +1854,18 @@ function BluetoothController:runSystemSetup()
             local mark = step.level == "ok" and "✓ " or (step.level == "warn" and "! " or "✗ ")
             table.insert(lines, mark .. step.msg)
         end
-        local head = ok and _("系统准备完成，现在可以配对手柄。") or _("系统准备失败：")
+        local has_error = false
+        for _i, step in ipairs(steps) do
+            if step.level == "error" then has_error = true end
+        end
+        local head
+        if not ok then
+            head = _("系统准备失败：")
+        elseif has_error then
+            head = _("系统准备未完全完成：")
+        else
+            head = _("系统准备完成，现在可以配对手柄。")
+        end
         UIManager:show(InfoMessage:new{ text = head .. "\n\n" .. table.concat(lines, "\n") })
     end)
 end
@@ -1877,21 +1895,104 @@ function BluetoothController:maybePromptSystemSetup()
     end)
 end
 
---- 输入蓝牙地址并配对新设备（实验性）
+-- =======================================================
+--  搜索并配对新设备（无需知道蓝牙地址）
+-- =======================================================
+
+local SCAN_SECONDS = 12        -- 搜索时长
+local BOND_WAIT_POLLS = 12     -- 等待系统完成配对（每秒检查一次）
+local INPUT_WAIT_POLLS = 8     -- 等待输入设备出现（每秒检查一次）
+
+local function schedule(delay, fn)
+    UIManager:scheduleIn(delay, fn)
+end
+
+--- 入口：确保蓝牙已开启，然后搜索周围的设备
 function BluetoothController:pairNewDevice()
     if SystemSetup.isUnsupportedModel() then
         self:showUnsupportedModel()
         return
     end
-    if not _G.KOBluetoothStateManager or not _G.KOBluetoothStateManager:isOn() then
-        UIManager:show(InfoMessage:new{ text = _("请先开启蓝牙"), timeout = 3 })
-        return
+    if BtControl.isOn() then
+        self:scanForDevices()
+    else
+        self:setBluetoothState(true, function(success)
+            if success then self:scanForDevices() end
+        end)
     end
-    if not SystemSetup.hasPairTool() then
-        UIManager:show(InfoMessage:new{ text = _("未找到 ace_bt_cli，无法配对"), timeout = 3 })
-        return
+end
+
+function BluetoothController:scanForDevices()
+    BtControl.startScan()
+    local progress = InfoMessage:new{
+        text = string.format(_("正在搜索附近的蓝牙设备（约 %d 秒）...\n\n请先让手柄进入配对模式。"), SCAN_SECONDS),
+    }
+    UIManager:show(progress)
+    UIManager:forceRePaint()
+
+    schedule(SCAN_SECONDS, function()
+        UIManager:close(progress)
+        self:showDiscoveredDevices(BtControl.getDiscovered())
+    end)
+end
+
+function BluetoothController:showDiscoveredDevices(devices)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local MAX_DEVICES = 8
+    local dialog
+    local rows = {}
+
+    for index, device in ipairs(devices) do
+        if index > MAX_DEVICES then break end
+        local label = device.name
+        if device.paired then
+            label = label .. " " .. _("（已配对）")
+        end
+        table.insert(rows, {
+            {
+                text = label,
+                callback = function()
+                    UIManager:close(dialog)
+                    self:pairDevice(device.address, device.name)
+                end,
+            },
+        })
     end
 
+    table.insert(rows, {
+        {
+            text = _("重新搜索"),
+            callback = function()
+                UIManager:close(dialog)
+                self:scanForDevices()
+            end,
+        },
+        {
+            text = _("手动输入地址"),
+            callback = function()
+                UIManager:close(dialog)
+                self:enterAddressManually()
+            end,
+        },
+    })
+    table.insert(rows, {
+        {
+            text = _("关闭"),
+            callback = function() UIManager:close(dialog) end,
+        },
+    })
+
+    dialog = ButtonDialog:new{
+        title = #devices > 0
+                and _("选择要配对的设备")
+                or _("未发现设备。请确认手柄处于配对模式（仅支持经典蓝牙，不支持 BLE），然后重新搜索。"),
+        buttons = rows,
+    }
+    UIManager:show(dialog)
+end
+
+--- 备用：手动输入蓝牙地址
+function BluetoothController:enterAddressManually()
     local InputDialog = require("ui/widget/inputdialog")
     local dialog
     dialog = InputDialog:new{
@@ -1913,7 +2014,7 @@ function BluetoothController:pairNewDevice()
                         mac = mac:gsub("%-", ":")
                         if SystemSetup.isValidMac(mac) then
                             UIManager:close(dialog)
-                            self:runPairing(mac)
+                            self:pairDevice(mac:upper(), nil)
                         else
                             UIManager:show(InfoMessage:new{ text = _("蓝牙地址格式错误"), timeout = 2 })
                         end
@@ -1926,54 +2027,102 @@ function BluetoothController:pairNewDevice()
     dialog:onShowKeyboard()
 end
 
-function BluetoothController:runPairing(mac)
-    local progress = InfoMessage:new{ text = _("正在配对，请稍候（约 20 秒）...") }
+--- 配对：先用系统自带的 Bond，未完成时再用 ace_bt_cli 作为备用
+function BluetoothController:pairDevice(mac, name)
+    local progress = InfoMessage:new{
+        text = string.format(_("正在配对：%s ..."), name or mac),
+    }
     UIManager:show(progress)
     UIManager:forceRePaint()
 
-    UIManager:scheduleIn(0.3, function()
-        local ok, log = SystemSetup.pair(mac)
+    local function finish()
         UIManager:close(progress)
+        self:finishPairing(mac, name)
+    end
 
-        if not ok then
-            UIManager:show(InfoMessage:new{
-                text = log == "missing_tool" and _("未找到 ace_bt_cli，无法配对") or _("蓝牙地址格式错误"),
-                timeout = 3,
-            })
+    if BtControl.isPaired(mac) then
+        finish()
+        return
+    end
+
+    BtControl.bond(mac)
+    BtControl.poll(function() return BtControl.isPaired(mac) end,
+            schedule, 1, BOND_WAIT_POLLS, function(paired)
+        if paired or not SystemSetup.hasPairTool() then
+            finish()
             return
         end
+        -- 备用方式会阻塞约 20 秒，所以先把提示刷新出来
+        UIManager:close(progress)
+        progress = InfoMessage:new{ text = _("系统配对未完成，改用备用方式（约 20 秒）...") }
+        UIManager:show(progress)
+        UIManager:forceRePaint()
+        schedule(0.3, function()
+            SystemSetup.pair(mac)
+            finish()
+        end)
+    end)
+end
 
-        -- ace_bt_cli 的输出格式未经验证，因此以系统状态为准判断是否成功
-        local paired_device
+--- 配对之后：确认已配对、等待输入设备出现，并选中它
+function BluetoothController:finishPairing(mac, name)
+    -- 成功与否以系统状态为准，而不是命令的输出
+    local _ok, paired = BtControl.isPaired(mac)
+    if paired then
+        if paired.name ~= "" then name = paired.name end
+    else
         for _i, device in ipairs(self:getPairedBluetoothDevices() or {}) do
             if device.mac and device.mac:lower() == mac:lower() then
-                paired_device = device
+                paired = device
+                name = device.name or name
                 break
             end
         end
-        local input_path = paired_device and paired_device.name
-                and self:getInputDevicePathByName(paired_device.name)
+    end
 
-        if input_path then
-            self.config.device_name = paired_device.name
-            self.config.device_path = input_path
+    if not paired then
+        UIManager:show(InfoMessage:new{
+            text = _("未能确认配对成功。\n请确认手柄处于配对模式后重试。"),
+        })
+        return
+    end
+
+    local function complete()
+        local path = name and name ~= "" and self:getInputDevicePathByName(name)
+        if path then
+            self.config.device_name = name
+            self.config.device_path = path
             self:saveSettings()
             self:reloadDevice()
             UIManager:show(InfoMessage:new{
-                text = string.format(_("已配对并选择设备：%s"), paired_device.name),
+                text = string.format(_("已配对并选择设备：%s"), name),
                 timeout = 3,
-            })
-        elseif paired_device then
-            UIManager:show(InfoMessage:new{
-                text = string.format(_("已配对：%s\n但尚未发现输入设备，请确认手柄已连接，然后点击「重载设备」。"),
-                        paired_device.name or mac),
             })
         else
             UIManager:show(InfoMessage:new{
-                text = string.format(_("未能确认配对成功。\n请确认手柄处于配对模式后重试。\n\nace_bt_cli 输出：\n%s"),
-                        (log or ""):sub(-300)),
+                text = string.format(_("已配对：%s\n但尚未发现输入设备，请确认手柄已连接，然后点击「重载设备」。"),
+                        name or mac),
             })
         end
+    end
+
+    local function inputReady()
+        return name and name ~= "" and self:getInputDevicePathByName(name) ~= nil
+    end
+
+    if inputReady() then
+        complete()
+        return
+    end
+
+    -- 已配对但尚未连接：请求连接，并等待输入设备出现
+    local progress = InfoMessage:new{ text = _("正在连接设备...") }
+    UIManager:show(progress)
+    UIManager:forceRePaint()
+    BtControl.connect(mac)
+    BtControl.poll(inputReady, schedule, 1, INPUT_WAIT_POLLS, function()
+        UIManager:close(progress)
+        complete()
     end)
 end
 
@@ -1990,8 +2139,7 @@ function BluetoothController:addToMainMenu(menu_items)
                 text = _("蓝牙开关"),
                 keep_menu_open = true,
                 checked_func = function()
-                    local now = os.time()
-                    if (now - self.last_action_time) < 2 then
+                    if self.bt_busy then
                         return self.target_state
                     end
                     return _G.KOBluetoothStateManager:isOn()

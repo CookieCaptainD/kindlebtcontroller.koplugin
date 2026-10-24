@@ -126,8 +126,19 @@ function SystemSetup.hasTools()
 end
 
 -- ---------------------------------------------------------------
---  dmcc.sh handling (conservative)
+--  dmcc.sh handling
 -- ---------------------------------------------------------------
+--
+-- The guide asks to remove the `!` from the first `if` of /usr/bin/dmcc.sh.
+-- On the firmware this was written against, that line is
+--
+--     if [ ! -e "/PRE_GM_DEBUGGING_FEATURES_ENABLED__REMOVE_AT_GMC" ]; then
+--
+-- and the edited line is the same without the `!`. Only that exact line is
+-- touched; if the first `if` of the file looks different, nothing is written
+-- and the line is reported so that support for that firmware can be added.
+
+local DMCC_MARKER = "PRE_GM_DEBUGGING_FEATURES_ENABLED"
 
 --- Locate the first line that starts with `if`. Returns start, end, text.
 local function findFirstIf(content)
@@ -146,50 +157,55 @@ local function findFirstIf(content)
 end
 
 --- Classify the first `if` line of dmcc.sh.
---- Returns "patched" | "unpatched" | "unknown", plus the corrected line when "unpatched".
---- Only a line that mentions "core" and has an unambiguous negation is touched.
+--- Returns "patched" | "unpatched" | "unexpected", plus the corrected line when "unpatched".
 local function analyzeDmccLine(line)
-    if not line:lower():find("core", 1, true) then
-        return "unknown"
+    if not line:find(DMCC_MARKER, 1, true) then
+        return "unexpected"
     end
-    -- `if ! cmd ...`
-    local fixed, count = line:gsub("^(%s*if%s+)!%s*", "%1")
+    -- `if [ ! -e "..." ]; then`
+    local fixed, count = line:gsub("^(%s*if%s+%[%s+)!%s+", "%1")
     if count == 0 then
-        -- `if [ ! -f file ]`
-        fixed, count = line:gsub("(%[%s+)!%s+", "%1", 1)
+        -- `if ! [ -e "..." ]; then`
+        fixed, count = line:gsub("^(%s*if%s+)!%s*%[", "%1[")
     end
     if count > 0 then
         return "unpatched", fixed
     end
-    if not line:find("!", 1, true) then
+    if line:match("^%s*if%s+%[%s+%-e%s") then
         return "patched"
     end
-    return "unknown"
+    return "unexpected"
 end
 
+--- Returns "patched" | "unpatched" | "unexpected" | "missing", plus the first `if` line.
 local function getDmccState()
     local content = readFile(DMCC_PATH)
     if not content then return "missing" end
     local _s, _e, line = findFirstIf(content)
-    if not line then return "unknown" end
-    return (analyzeDmccLine(line))
+    if not line then return "unexpected", "" end
+    local state = analyzeDmccLine(line)
+    return state, line
 end
 
+--- Apply the dmcc.sh edit. Returns the new state, plus the offending line when "unexpected".
+--- "error" means the write failed (the original is restored from the backup).
 local function patchDmcc()
     local content = readFile(DMCC_PATH)
     if not content then return "missing" end
     local s, e, line = findFirstIf(content)
-    if not line then return "unknown" end
+    if not line then return "unexpected", "" end
     local state, fixed = analyzeDmccLine(line)
     if state ~= "unpatched" then return state, line end
 
     if not readFile(DMCC_BACKUP) then
-        local ok = writeFile(DMCC_BACKUP, content)
-        if not ok then return "error" end
+        if not writeFile(DMCC_BACKUP, content) then return "error" end
     end
     local new_content = content:sub(1, s - 1) .. fixed .. content:sub(e + 1)
-    local ok = writeFile(DMCC_PATH, new_content)
-    if not ok then return "error" end
+    if not writeFile(DMCC_PATH, new_content) or readFile(DMCC_PATH) ~= new_content then
+        -- never leave a half-written script behind
+        writeFile(DMCC_PATH, content)
+        return "error"
+    end
     return "patched"
 end
 
@@ -206,13 +222,15 @@ function SystemSetup.getState()
         script = script ~= nil and script:find("Event code 16 (Q)", 1, true) ~= nil,
         rules = rules ~= nil and rules:find("dev_is_keyboard.sh", 1, true) ~= nil,
         markers = true,
-        dmcc = getDmccState(),
     }
+    state.dmcc, state.dmcc_line = getDmccState()
     for _i, path in ipairs(MARKER_FILES) do
         local file = io.open(path, "r")
         if file then file:close() else state.markers = false end
     end
-    state.ok = state.script and state.rules and state.markers and state.dmcc ~= "unpatched"
+    -- "missing" (no dmcc.sh on this firmware) leaves nothing to do, so it counts as done
+    state.ok = state.script and state.rules and state.markers
+            and (state.dmcc == "patched" or state.dmcc == "missing")
     return state
 end
 
@@ -286,13 +304,17 @@ function SystemSetup.apply()
             add("warn", _("无法创建核心转储标记文件"))
         end
 
-        local dmcc_state = patchDmcc()
+        local dmcc_state, dmcc_line = patchDmcc()
         if dmcc_state == "patched" then
             add("ok", _("已调整 dmcc.sh（原文件已备份）"))
+        elseif dmcc_state == "missing" then
+            add("ok", _("此固件没有 dmcc.sh，无需调整"))
         elseif dmcc_state == "error" then
-            add("warn", _("修改 dmcc.sh 失败，已跳过"))
+            add("error", _("修改 dmcc.sh 失败，已恢复原文件"))
         else
-            add("warn", _("dmcc.sh 与预期不符，已跳过（可选步骤，详见 README）"))
+            -- not changed: show the line so that this firmware can be supported
+            add("error", string.format(_("dmcc.sh 的第一个 if 与预期不符，未修改：\n%s"),
+                    tostring(dmcc_line or ""):sub(1, 120)))
         end
     end)
 
